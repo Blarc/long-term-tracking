@@ -22,7 +22,7 @@ from .heads import SiamFC
 from .losses import BalancedLoss
 from .transforms import SiamFCTransforms
 
-__all__ = ['TrackerSiamFC']
+__all__ = ['TrackerSiamFCLongTerm']
 
 
 class Net(nn.Module):

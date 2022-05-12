@@ -2,14 +2,12 @@ import argparse
 import os
 import math
 import cv2
-import numpy as np
 
 from tools.sequence_utils import VOTSequence
 from tools.sequence_utils import read_results
 
 
 def visualize_results(dataset_path, results_dir, sequence_name):
-    
     sequence = VOTSequence(dataset_path, sequence_name)
 
     bboxes_path = os.path.join(results_dir, '%s_bboxes.txt' % sequence_name)
@@ -23,7 +21,7 @@ def visualize_results(dataset_path, results_dir, sequence_name):
         exit(-1)
 
     overlaps = [sequence.overlap(bb, gt) for bb, gt in zip(bboxes, sequence.gt)]
-        
+
     sequence.initialize_window('Window')
 
     for i in range(sequence.length()):
