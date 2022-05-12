@@ -38,10 +38,10 @@ class Net(nn.Module):
         return self.head(z, x)
 
 
-class TrackerSiamFC(Tracker):
+class TrackerSiamFCLongTerm(Tracker):
 
     def __init__(self, net_path=None, **kwargs):
-        super(TrackerSiamFC, self).__init__('SiamFC', True)
+        super(TrackerSiamFCLongTerm, self).__init__('SiamFC', True)
 
         self.kernel = None
         self.avg_color = None

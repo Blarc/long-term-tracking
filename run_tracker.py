@@ -5,16 +5,20 @@ import cv2
 from tools.sequence_utils import VOTSequence
 from tools.sequence_utils import save_results
 from siamfc import TrackerSiamFC
+from siamfc.siamfc_long_term import TrackerSiamFCLongTerm
 
 
-def evaluate_tracker(dataset_path, network_path, results_dir, visualize):
+def evaluate_tracker(dataset_path, network_path, results_dir, visualize, long_term=False):
     
     sequences = []
     with open(os.path.join(dataset_path, 'list.txt'), 'r') as f:
         for line in f.readlines():
             sequences.append(line.strip())
 
-    tracker = TrackerSiamFC(net_path=network_path)
+    if long_term:
+      tracker = TrackerSiamFCLongTerm(net_path=network_path)
+    else:
+      tracker = TrackerSiamFC(net_path=network_path)
 
     for sequence_name in sequences:
         
@@ -64,7 +68,8 @@ parser.add_argument("--dataset", help="Path to the dataset", required=True, acti
 parser.add_argument("--net", help="Path to the pre-trained network", required=True, action='store')
 parser.add_argument("--results_dir", help="Path to the directory to store the results", required=True, action='store')
 parser.add_argument("--visualize", help="Show ground-truth annotations", required=False, action='store_true')
+parser.add_argument("--long", help="Run long term tracker.", required=False, action='store_true')
 
 args = parser.parse_args()
 
-evaluate_tracker(args.dataset, args.net, args.results_dir, args.visualize)
+evaluate_tracker(args.dataset, args.net, args.results_dir, args.visualize, args.long)
