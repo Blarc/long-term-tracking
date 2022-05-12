@@ -2,7 +2,9 @@ from __future__ import absolute_import, division, print_function
 
 import os
 import sys
+import time
 from collections import namedtuple
+from statistics import mean
 
 import cv2
 import numpy as np
@@ -29,7 +31,7 @@ class Net(nn.Module):
         super(Net, self).__init__()
         self.backbone = backbone
         self.head = head
-    
+
     def forward(self, z, x):
         z = self.backbone(z)
         x = self.backbone(x)
@@ -40,6 +42,17 @@ class TrackerSiamFC(Tracker):
 
     def __init__(self, net_path=None, **kwargs):
         super(TrackerSiamFC, self).__init__('SiamFC', True)
+
+        self.kernel = None
+        self.avg_color = None
+        self.x_size = None
+        self.z_size = None
+        self.scale_factors = None
+        self.hanning_window = None
+        self.upscale_size = None
+        self.target_size = None
+        self.center = None
+
         self.cfg = self.parse_args(**kwargs)
 
         # setup GPU device if available
@@ -51,7 +64,7 @@ class TrackerSiamFC(Tracker):
             backbone=AlexNetV1(),
             head=SiamFC(self.cfg.out_scale))
         ops.init_weights(self.net)
-        
+
         # load checkpoint if provided
         if net_path is not None:
             self.net.load_state_dict(torch.load(
@@ -67,12 +80,24 @@ class TrackerSiamFC(Tracker):
             lr=self.cfg.initial_lr,
             weight_decay=self.cfg.weight_decay,
             momentum=self.cfg.momentum)
-        
+
         # setup lr scheduler
         gamma = np.power(
             self.cfg.ultimate_lr / self.cfg.initial_lr,
             1.0 / self.cfg.epoch_num)
         self.lr_scheduler = ExponentialLR(self.optimizer, gamma)
+
+        self.failure_threshold = 3.5
+        self.redetection_threshold = None
+        self.redetection_samples = 20
+
+        self.sampling_method = "gauss"  # random/gauss
+        self.gauss_cov = 4500
+        self.target_visible = True
+        self.frame = 0
+
+        self.target_correlations = []
+        self.initial_target_correlation = None
 
     def parse_args(self, **kwargs):
         # default parameters
@@ -101,78 +126,120 @@ class TrackerSiamFC(Tracker):
             'momentum': 0.9,
             'r_pos': 16,
             'r_neg': 0}
-        
+
         for key, val in kwargs.items():
             if key in cfg:
                 cfg.update({key: val})
         return namedtuple('Config', cfg.keys())(**cfg)
-    
+
+    def random_samples(self, method, img_size):
+        if method == "random":
+            x_positions = np.random.randint(10, img_size[0], self.redetection_samples).astype("float")
+            y_positions = np.random.randint(10, img_size[1], self.redetection_samples).astype("float")
+            return np.array([[x, y] for x, y in zip(x_positions, y_positions)])
+        elif method == "gauss":
+            return np.random.multivariate_normal(self.center, np.array([[self.gauss_cov, 0], [0, self.gauss_cov]]),
+                                                 self.redetection_samples)
+        else:
+            raise NotImplementedError
+
     @torch.no_grad()
-    def init(self, img, box):
+    def init(self, img, box_):
         # set to evaluation mode
         self.net.eval()
 
         # convert box to 0-indexed and center based [y, x, h, w]
-        box = np.array([
-            box[1] - 1 + (box[3] - 1) / 2,
-            box[0] - 1 + (box[2] - 1) / 2,
-            box[3], box[2]], dtype=np.float32)
-        self.center, self.target_sz = box[:2], box[2:]
+        box_ = np.array([
+            box_[1] - 1 + (box_[3] - 1) / 2,
+            box_[0] - 1 + (box_[2] - 1) / 2,
+            box_[3], box_[2]], dtype=np.float32)
+        self.center, self.target_size = box_[:2], box_[2:]
 
-        # create hanning window
-        self.upscale_sz = self.cfg.response_up * self.cfg.response_sz
-        self.hann_window = np.outer(
-            np.hanning(self.upscale_sz),
-            np.hanning(self.upscale_sz))
-        self.hann_window /= self.hann_window.sum()
+        # create Hanning window
+        self.upscale_size = self.cfg.response_up * self.cfg.response_sz
+        self.hanning_window = np.outer(np.hanning(self.upscale_size), np.hanning(self.upscale_size))
+        self.hanning_window /= self.hanning_window.sum()
 
         # search scale factors
-        self.scale_factors = self.cfg.scale_step ** np.linspace(
-            -(self.cfg.scale_num // 2),
-            self.cfg.scale_num // 2, self.cfg.scale_num)
+        self.scale_factors = self.cfg.scale_step ** np.linspace(-(self.cfg.scale_num // 2), self.cfg.scale_num // 2,
+                                                                self.cfg.scale_num)
 
         # exemplar and search sizes
-        context = self.cfg.context * np.sum(self.target_sz)
-        self.z_sz = np.sqrt(np.prod(self.target_sz + context))
-        self.x_sz = self.z_sz * \
-            self.cfg.instance_sz / self.cfg.exemplar_sz
-        
+        context = self.cfg.context * np.sum(self.target_size)
+        self.z_size = np.sqrt(np.prod(self.target_size + context))
+        self.x_size = self.z_size * self.cfg.instance_sz / self.cfg.exemplar_sz
+
         # exemplar image
         self.avg_color = np.mean(img, axis=(0, 1))
         z = ops.crop_and_resize(
-            img, self.center, self.z_sz,
+            img,
+            self.center,
+            self.z_size,
             out_size=self.cfg.exemplar_sz,
-            border_value=self.avg_color)
-        
+            border_value=self.avg_color
+        )
+
         # exemplar features
-        z = torch.from_numpy(z).to(
-            self.device).permute(2, 0, 1).unsqueeze(0).float()
+        z = torch.from_numpy(z).to(self.device).permute(2, 0, 1).unsqueeze(0).float()
         self.kernel = self.net.backbone(z)
-    
+
     @torch.no_grad()
     def update(self, img):
         # set to evaluation mode
         self.net.eval()
 
-        # search images
-        x = [ops.crop_and_resize(
-            img, self.center, self.x_sz * f,
-            out_size=self.cfg.instance_sz,
-            border_value=self.avg_color) for f in self.scale_factors]
+        self.frame += 1
+        start_time = time.time()
+
+        # for debugging
+        prev_visible = False if self.target_visible is None else self.target_visible
+
+        # Target is visible
+        if self.target_visible:
+            # search images
+            x = []
+            for f in self.scale_factors:
+                x.append(ops.crop_and_resize(
+                    img,
+                    self.center,
+                    self.x_size * f,
+                    out_size=self.cfg.instance_sz,
+                    border_value=self.avg_color
+                ))
+
+        # Target is not visible -> re-detection
+        else:
+            # Random positions around previous seen position of target
+            positions = self.random_samples(self.sampling_method, (img.shape[0], img.shape[1]))
+
+            # for x, y in positions:
+            #     image = cv2.circle(img, (int(y), int(x)), radius=0, color=(0, 0, 255), thickness=4)
+            # cv2.imshow("SAMPLES - " + self.sampling_method, image)
+            # cv2.waitKey(0)
+            # cv2.destroyAllWindows()
+
+            x = []
+            for position in positions:
+                x.append(ops.crop_and_resize(
+                    img,
+                    position,
+                    self.x_size,
+                    out_size=self.cfg.instance_sz,
+                    border_value=self.avg_color
+                ))
+
         x = np.stack(x, axis=0)
-        x = torch.from_numpy(x).to(
-            self.device).permute(0, 3, 1, 2).float()
-        
+        x = torch.from_numpy(x) \
+            .to(self.device) \
+            .permute(0, 3, 1, 2).float()
+
         # responses
         x = self.net.backbone(x)
         responses = self.net.head(self.kernel, x)
         responses = responses.squeeze(1).cpu().numpy()
 
-        # upsample responses and penalize scale changes
-        responses = np.stack([cv2.resize(
-            u, (self.upscale_sz, self.upscale_sz),
-            interpolation=cv2.INTER_CUBIC)
-            for u in responses])
+        # up-sample responses and penalize scale changes
+        responses = np.stack([cv2.resize(u, (self.upscale_size, self.upscale_size), interpolation=cv2.INTER_CUBIC) for u in responses])
         responses[:self.cfg.scale_num // 2] *= self.cfg.scale_penalty
         responses[self.cfg.scale_num // 2 + 1:] *= self.cfg.scale_penalty
 
@@ -181,36 +248,73 @@ class TrackerSiamFC(Tracker):
 
         # peak location
         response = responses[scale_id]
-        max_resp = max(0, response.max())
+        max_response = max(0, response.max())
+        # print(max_resp)
+
+        # This happens only the first time
+        if not self.initial_target_correlation:
+            self.initial_target_correlation = max_response
+
+        # Target corrleations will be empty only the first time
+        if not self.target_correlations or self.target_visible:
+            self.target_correlations.append(max_response)
+            self.redetection_threshold = mean(self.target_correlations) - 0.2
+
         response -= response.min()
         response /= response.sum() + 1e-16
-        response = (1 - self.cfg.window_influence) * response + \
-            self.cfg.window_influence * self.hann_window
+        response = (1 - self.cfg.window_influence) * response + self.cfg.window_influence * self.hanning_window
         loc = np.unravel_index(response.argmax(), response.shape)
 
-        # locate target center
-        disp_in_response = np.array(loc) - (self.upscale_sz - 1) / 2
-        disp_in_instance = disp_in_response * \
-            self.cfg.total_stride / self.cfg.response_up
-        disp_in_image = disp_in_instance * self.x_sz * \
-            self.scale_factors[scale_id] / self.cfg.instance_sz
-        self.center += disp_in_image
+        # Locate target center
+        disp_in_response = np.array(loc) - (self.upscale_size - 1) / 2
+        disp_in_instance = disp_in_response * self.cfg.total_stride / self.cfg.response_up
 
-        # update target size
-        scale =  (1 - self.cfg.scale_lr) * 1.0 + \
-            self.cfg.scale_lr * self.scale_factors[scale_id]
-        self.target_sz *= scale
-        self.z_sz *= scale
-        self.x_sz *= scale
+        if self.target_visible:
+            disp_in_image = disp_in_instance * self.x_size * self.scale_factors[scale_id] / self.cfg.instance_sz
+            self.center += disp_in_image
+            scale = (1 - self.cfg.scale_lr) * 1.0 + self.cfg.scale_lr * self.scale_factors[scale_id]
+        else:
+            scale = (1 - self.cfg.scale_lr) * 1.0 + self.cfg.scale_lr
+
+        self.target_size *= scale
+        self.z_size *= scale
+        self.x_size *= scale
+
+        # Target is visible if max response is higher than threshold
+        if not self.target_visible and max_response > self.redetection_threshold:
+            self.target_visible = True
+        elif self.target_visible and max_response < self.failure_threshold:
+            self.target_visible = False
 
         # return 1-indexed and left-top based bounding box
         box = np.array([
-            self.center[1] + 1 - (self.target_sz[1] - 1) / 2,
-            self.center[0] + 1 - (self.target_sz[0] - 1) / 2,
-            self.target_sz[1], self.target_sz[0]])
+            self.center[1] + 1 - (self.target_size[1] - 1) / 2,
+            self.center[0] + 1 - (self.target_size[0] - 1) / 2,
+            self.target_size[1], self.target_size[0]])
 
-        return box, max_resp
-    
+        end_time = time.time()
+        # if self.frame % 50 == 0:
+        #     print("FPS: ", 1 / (end_time - start_time))
+
+        if prev_visible and not self.target_visible:
+            print("Target lost")
+            # cv2.imshow("LOST", img)
+            # cv2.waitKey(0)
+            # cv2.destroyAllWindows()
+        elif not prev_visible and self.target_visible:
+            print("Target found")
+            # image2 = cv2.circle(img, (self.center[1], self.center[0]), radius=0, color=(255, 0, 0), thickness=10)
+            # cv2.imshow("FOUND", image2)
+            # cv2.waitKey(0)
+            # cv2.destroyAllWindows()
+
+        if not self.target_visible:
+            max_response = 0
+        else:
+            max_response = max_response / self.initial_target_correlation
+
+        return box, max_response
+
     def train_step(self, batch, backward=True):
         # set network mode
         self.net.train(backward)
@@ -226,13 +330,13 @@ class TrackerSiamFC(Tracker):
             # calculate loss
             labels = self._create_labels(responses.size())
             loss = self.criterion(responses, labels)
-            
+
             if backward:
                 # back propagation
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-        
+
         return loss.item()
 
     @torch.enable_grad()
@@ -253,7 +357,7 @@ class TrackerSiamFC(Tracker):
         dataset = Pair(
             seqs=seqs,
             transforms=transforms)
-        
+
         # setup dataloader
         dataloader = DataLoader(
             dataset,
@@ -262,7 +366,7 @@ class TrackerSiamFC(Tracker):
             num_workers=self.cfg.num_workers,
             pin_memory=self.cuda,
             drop_last=True)
-        
+
         # loop over epochs
         for epoch in range(self.cfg.epoch_num):
             # update lr at each epoch
@@ -274,14 +378,14 @@ class TrackerSiamFC(Tracker):
                 print('Epoch: {} [{}/{}] Loss: {:.5f}'.format(
                     epoch + 1, it + 1, len(dataloader), loss))
                 sys.stdout.flush()
-            
+
             # save checkpoint
             if not os.path.exists(save_dir):
                 os.makedirs(save_dir)
             net_path = os.path.join(
                 save_dir, 'siamfc_alexnet_e%d.pth' % (epoch + 1))
             torch.save(self.net.state_dict(), net_path)
-    
+
     def _create_labels(self, size):
         # skip if same sized labels already created
         if hasattr(self, 'labels') and self.labels.size() == size:
@@ -313,5 +417,5 @@ class TrackerSiamFC(Tracker):
 
         # convert to tensors
         self.labels = torch.from_numpy(labels).to(self.device).float()
-        
+
         return self.labels
