@@ -1,7 +1,8 @@
 import argparse
-import os
 import math
-import cv2
+import os
+
+import numpy
 import numpy as np
 
 from tools.sequence_utils import VOTSequence
@@ -69,6 +70,7 @@ def evaluate_performance(dataset_path, results_dir, latex=False):
 
     scores_all = []
     overlaps_all = []
+    fps_all = []
 
     datasets = []
     for sequence_name in sequences:
@@ -78,9 +80,11 @@ def evaluate_performance(dataset_path, results_dir, latex=False):
 
         bboxes_path = os.path.join(results_dir, '%s_bboxes.txt' % sequence_name)
         scores_path = os.path.join(results_dir, '%s_scores.txt' % sequence_name)
+        fps_path = os.path.join(results_dir, '%s_fps.txt' % sequence_name)
 
         bboxes = read_results(bboxes_path)
         scores = read_results(scores_path)
+        fps_list = read_results(fps_path)
 
         if len(sequence.gt) != len(bboxes):
             print('Groundtruth and results does not have the same number of elements.')
@@ -90,25 +94,30 @@ def evaluate_performance(dataset_path, results_dir, latex=False):
 
         scores_all.append(scores)
         overlaps_all.append(overlaps)
+        fps_all.append(fps_list)
 
         pr, re, f = calculate_pr_re_f([sequence], [overlaps], [scores], estimate_thresholds([scores], 100))
+        avg_fps = numpy.average(fps_list)
         if latex:
-            print(f'{sequence_name} & {pr} & {re} & {f} \\\\\n\\hline')
+            print(f'{sequence_name} & {pr} & {re} & {f} & {avg_fps} \\\\\n\\hline')
         else:
             print(f'----------{sequence_name}-----------')
-            print('Precision:', pr)
-            print('Recall:', re)
-            print('F-score:', f)
+            print(f'Precision: {pr}')
+            print(f'Recall: {re}')
+            print(f'F-score: {f}')
+            print(f'Avg-FPS: {avg_fps}')
 
     pr, re, f = calculate_pr_re_f(datasets, overlaps_all, scores_all, estimate_thresholds(scores_all, 100))
+    avg_fps = numpy.average(fps_all)
 
     if latex:
-        print(f'all & {pr} & {re} & {f} \\\\\n\\hline')
+        print(f'all & {pr} & {re} & {f} & {avg_fps} \\\\\n\\hline')
     else:
-        print('----------all-------------')
-        print('Precision:', pr)
-        print('Recall:', re)
-        print('F-score:', f)
+        print(f'----------all-----------')
+        print(f'Precision: {pr}')
+        print(f'Recall: {re}')
+        print(f'F-score: {f}')
+        print(f'Avg-FPS: {avg_fps}')
 
 
 parser = argparse.ArgumentParser(description='Long-Term Tracking Performance Evaluation Script')

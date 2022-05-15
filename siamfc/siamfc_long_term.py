@@ -79,12 +79,14 @@ class TrackerSiamFCLongTerm(Tracker):
             self.net.parameters(),
             lr=self.cfg.initial_lr,
             weight_decay=self.cfg.weight_decay,
-            momentum=self.cfg.momentum)
+            momentum=self.cfg.momentum
+        )
 
         # setup lr scheduler
         gamma = np.power(
             self.cfg.ultimate_lr / self.cfg.initial_lr,
-            1.0 / self.cfg.epoch_num)
+            1.0 / self.cfg.epoch_num
+        )
         self.lr_scheduler = ExponentialLR(self.optimizer, gamma)
 
         self.failure_threshold = 3.5
@@ -94,7 +96,7 @@ class TrackerSiamFCLongTerm(Tracker):
         self.sampling_method = "gauss"  # random/gauss
         self.gauss_cov = 4500
         self.target_visible = True
-        self.frame = 0
+        self.frame_index = 0
 
         self.target_correlations = []
         self.initial_target_correlation = None
@@ -188,11 +190,8 @@ class TrackerSiamFCLongTerm(Tracker):
         # set to evaluation mode
         self.net.eval()
 
-        self.frame += 1
+        self.frame_index += 1
         start_time = time.time()
-
-        # for debugging
-        prev_visible = False if self.target_visible is None else self.target_visible
 
         # Target is visible
         if self.target_visible:
@@ -211,12 +210,6 @@ class TrackerSiamFCLongTerm(Tracker):
         else:
             # Random positions around previous seen position of target
             positions = self.random_samples(self.sampling_method, (img.shape[0], img.shape[1]))
-
-            # for x, y in positions:
-            #     image = cv2.circle(img, (int(y), int(x)), radius=0, color=(0, 0, 255), thickness=4)
-            # cv2.imshow("SAMPLES - " + self.sampling_method, image)
-            # cv2.waitKey(0)
-            # cv2.destroyAllWindows()
 
             x = []
             for position in positions:
@@ -239,7 +232,8 @@ class TrackerSiamFCLongTerm(Tracker):
         responses = responses.squeeze(1).cpu().numpy()
 
         # up-sample responses and penalize scale changes
-        responses = np.stack([cv2.resize(u, (self.upscale_size, self.upscale_size), interpolation=cv2.INTER_CUBIC) for u in responses])
+        responses = np.stack(
+            [cv2.resize(u, (self.upscale_size, self.upscale_size), interpolation=cv2.INTER_CUBIC) for u in responses])
         responses[:self.cfg.scale_num // 2] *= self.cfg.scale_penalty
         responses[self.cfg.scale_num // 2 + 1:] *= self.cfg.scale_penalty
 
@@ -255,7 +249,7 @@ class TrackerSiamFCLongTerm(Tracker):
         if not self.initial_target_correlation:
             self.initial_target_correlation = max_response
 
-        # Target corrleations will be empty only the first time
+        # Target correlations will be empty only the first time
         if not self.target_correlations or self.target_visible:
             self.target_correlations.append(max_response)
             self.redetection_threshold = mean(self.target_correlations) - 0.2
@@ -292,28 +286,12 @@ class TrackerSiamFCLongTerm(Tracker):
             self.center[0] + 1 - (self.target_size[0] - 1) / 2,
             self.target_size[1], self.target_size[0]])
 
-        end_time = time.time()
-        # if self.frame % 50 == 0:
-        #     print("FPS: ", 1 / (end_time - start_time))
-
-        if prev_visible and not self.target_visible:
-            print("Target lost")
-            # cv2.imshow("LOST", img)
-            # cv2.waitKey(0)
-            # cv2.destroyAllWindows()
-        elif not prev_visible and self.target_visible:
-            print("Target found")
-            # image2 = cv2.circle(img, (self.center[1], self.center[0]), radius=0, color=(255, 0, 0), thickness=10)
-            # cv2.imshow("FOUND", image2)
-            # cv2.waitKey(0)
-            # cv2.destroyAllWindows()
-
         if not self.target_visible:
             max_response = 0
         else:
             max_response = max_response / self.initial_target_correlation
 
-        return box, max_response
+        return box, max_response, time.time() - start_time
 
     def train_step(self, batch, backward=True):
         # set network mode

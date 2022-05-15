@@ -26,6 +26,7 @@ def evaluate_tracker(dataset_path, network_path, results_dir, visualize, long_te
 
         bboxes_path = os.path.join(results_dir, '%s_bboxes.txt' % sequence_name)
         scores_path = os.path.join(results_dir, '%s_scores.txt' % sequence_name)
+        fps_path = os.path.join(results_dir, '%s_fps.txt' % sequence_name)
 
         if os.path.exists(bboxes_path) and os.path.exists(scores_path):
             print('Results on this sequence already exists. Skipping.')
@@ -38,15 +39,17 @@ def evaluate_tracker(dataset_path, network_path, results_dir, visualize, long_te
         tracker.init(img, gt_rect)
         results = [gt_rect]
         scores = [[10000]]  # a very large number - very confident at initialization
+        fps_list = []
 
         if visualize:
             cv2.namedWindow('win', cv2.WINDOW_AUTOSIZE)
         for i in range(1, sequence.length()):
 
             img = cv2.imread(sequence.frame(i))
-            prediction, score = tracker.update(img)
+            prediction, score, fps = tracker.update(img)
             results.append(prediction)
             scores.append([score])
+            fps_list.append(fps)
 
             if visualize:
                 tl_ = (int(round(prediction[0])), int(round(prediction[1])))
@@ -60,6 +63,7 @@ def evaluate_tracker(dataset_path, network_path, results_dir, visualize, long_te
         
         save_results(results, bboxes_path)
         save_results(scores, scores_path)
+        save_results(fps_list, fps_path)
 
 
 parser = argparse.ArgumentParser(description='SiamFC Runner Script')
